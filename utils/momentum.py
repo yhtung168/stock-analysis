@@ -92,7 +92,8 @@ def fetch_tw_stock_universe(progress_callback=None) -> pd.DataFrame:
     try:
         # Step 1: Get company info (shares outstanding + sector)
         url_info = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
-        resp = requests.get(url_info, timeout=15)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StockAnalysisPlatform/1.0"}
+        resp = requests.get(url_info, timeout=30, headers=headers)
         resp.raise_for_status()
         info_data = resp.json()
         df_info = pd.DataFrame(info_data)
@@ -117,7 +118,7 @@ def fetch_tw_stock_universe(progress_callback=None) -> pd.DataFrame:
         # Step 2: Get today's closing prices
         time.sleep(0.5)
         url_price = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        resp2 = requests.get(url_price, timeout=15)
+        resp2 = requests.get(url_price, timeout=30, headers=headers)
         resp2.raise_for_status()
         price_data = resp2.json()
         df_price = pd.DataFrame(price_data)
@@ -159,15 +160,45 @@ def fetch_tw_stock_universe(progress_callback=None) -> pd.DataFrame:
         return merged.copy()
 
     except Exception as e:
-        print(f"[WARN] Failed to fetch TW universe: {e}")
-        # Fallback: return static list with no sector info
-        return pd.DataFrame({
-            "Code": [t.replace(".TW", "") for t in TW_TOP50],
-            "Name": TW_TOP50,
-            "Sector": "未知",
-            "Ticker": TW_TOP50,
-            "MarketCap_Rank": range(1, len(TW_TOP50) + 1),
-        })
+        print(f"[WARN] Failed to fetch TW universe from TWSE API: {e}")
+        print("[INFO] Using static TW Top 50 with hardcoded sector info")
+        # Fallback: static list WITH sector classification
+        return _tw_static_fallback()
+
+
+def _tw_static_fallback() -> pd.DataFrame:
+    """Static fallback with sector info for when TWSE API is unreachable (e.g., Streamlit Cloud overseas IP)."""
+    _tw_static = [
+        ("2330", "台積電", "半導體"), ("2317", "鴻海", "其他電子"), ("2454", "聯發科", "半導體"),
+        ("2308", "台達電", "電子零組件"), ("2382", "廣達", "電腦及週邊設備"),
+        ("2303", "聯電", "半導體"), ("2412", "中華電", "通信網路"),
+        ("2881", "富邦金", "金融保險"), ("2882", "國泰金", "金融保險"), ("2886", "兆豐金", "金融保險"),
+        ("2891", "中信金", "金融保險"), ("2884", "玉山金", "金融保險"), ("2885", "元大金", "金融保險"),
+        ("3711", "日月光投控", "半導體"), ("2357", "華碩", "電腦及週邊設備"),
+        ("1301", "台塑", "塑膠"), ("1303", "南亞", "塑膠"), ("1326", "台化", "塑膠"),
+        ("2002", "中鋼", "鋼鐵"), ("1216", "統一", "食品"),
+        ("2912", "統一超", "貿易百貨"), ("5880", "合庫金", "金融保險"),
+        ("2892", "第一金", "金融保險"), ("3008", "大立光", "光電"), ("2207", "和泰車", "汽車"),
+        ("6669", "緯穎", "電腦及週邊設備"), ("2603", "長榮", "航運"),
+        ("5871", "中租-KY", "金融保險"), ("2880", "華南金", "金融保險"), ("3045", "台灣大", "通信網路"),
+        ("2801", "彰銀", "金融保險"), ("4904", "遠傳", "通信網路"),
+        ("9910", "豐泰", "其他電子"), ("2301", "光寶科", "電腦及週邊設備"), ("4938", "和碩", "電腦及週邊設備"),
+        ("2345", "智邦", "通信網路"), ("3034", "聯詠", "半導體"),
+        ("2379", "瑞昱", "半導體"), ("6505", "台塑化", "塑膠"), ("1101", "台泥", "水泥"),
+        ("2395", "研華", "電腦及週邊設備"), ("8046", "南電", "電子零組件"),
+        ("3231", "緯創", "電腦及週邊設備"), ("2327", "國巨", "電子零組件"),
+        ("5876", "上海商銀", "金融保險"), ("3037", "欣興", "電子零組件"),
+        ("2883", "凱基金", "金融保險"), ("2887", "台新金", "金融保險"),
+        ("6415", "矽力-KY", "半導體"), ("2105", "正新", "橡膠"),
+    ]
+    df = pd.DataFrame(_tw_static, columns=["Code", "Name", "Sector"])
+    df["Ticker"] = df["Code"] + ".TW"
+    df["MarketCap_Rank"] = range(1, len(df) + 1)
+    df["Shares"] = 0
+    df["Price"] = 0
+    df["MarketCap"] = 0
+    df["MarketCap_B"] = 0
+    return df
 
 
 def get_tw_sectors() -> List[str]:

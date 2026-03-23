@@ -49,6 +49,21 @@ class DataStore:
         return st.session_state[key]
 
     @staticmethod
+    def _ensure_chip_data(ticker: str, start: str, end: str):
+        """Fetch both institutional + margin in a single pass (TW only)."""
+        market = get_market(ticker)
+        if market not in ("TW", "TWO"):
+            return
+        stock_id = twse_api.ticker_to_stock_id(ticker)
+        start_fmt = start.replace("-", "")
+        end_fmt = end.replace("-", "")
+        key = f"chip_{stock_id}_{start_fmt}_{end_fmt}"
+        if key not in st.session_state:
+            st.session_state[key] = twse_api.fetch_chip_data_combined(
+                stock_id, start_fmt, end_fmt
+            )
+
+    @staticmethod
     def get_institutional_data(
         ticker: str, start: str, end: str
     ) -> pd.DataFrame:
@@ -56,15 +71,13 @@ class DataStore:
         market = get_market(ticker)
         if market not in ("TW", "TWO"):
             return pd.DataFrame()
+        DataStore._ensure_chip_data(ticker, start, end)
         stock_id = twse_api.ticker_to_stock_id(ticker)
         start_fmt = start.replace("-", "")
         end_fmt = end.replace("-", "")
-        key = f"inst_{stock_id}_{start_fmt}_{end_fmt}"
-        if key not in st.session_state:
-            st.session_state[key] = twse_api.fetch_institutional_trading_range(
-                stock_id, start_fmt, end_fmt
-            )
-        return st.session_state[key]
+        key = f"chip_{stock_id}_{start_fmt}_{end_fmt}"
+        chip = st.session_state.get(key, {})
+        return chip.get("institutional", pd.DataFrame())
 
     @staticmethod
     def get_margin_data(
@@ -74,15 +87,13 @@ class DataStore:
         market = get_market(ticker)
         if market not in ("TW", "TWO"):
             return pd.DataFrame()
+        DataStore._ensure_chip_data(ticker, start, end)
         stock_id = twse_api.ticker_to_stock_id(ticker)
         start_fmt = start.replace("-", "")
         end_fmt = end.replace("-", "")
-        key = f"margin_{stock_id}_{start_fmt}_{end_fmt}"
-        if key not in st.session_state:
-            st.session_state[key] = twse_api.fetch_margin_trading_range(
-                stock_id, start_fmt, end_fmt
-            )
-        return st.session_state[key]
+        key = f"chip_{stock_id}_{start_fmt}_{end_fmt}"
+        chip = st.session_state.get(key, {})
+        return chip.get("margin", pd.DataFrame())
 
     @staticmethod
     def get_multiple_prices(

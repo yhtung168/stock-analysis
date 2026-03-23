@@ -1,18 +1,44 @@
-"""Momentum screening: find strong/weak stocks over various periods."""
+"""Momentum screening: find strong/weak stocks over various periods.
+
+Features:
+  - Dynamic stock lists by market cap rank (e.g., rank 1-50, 50-100)
+  - Sector/industry classification for both TW and US
+  - Sector-level momentum analysis (which sectors are hot?)
+  - Stock-level momentum within a sector
+"""
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict
 import io
+import time
+import requests
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import COLORS
 
+# TWSE sector code to Chinese name mapping
+TW_SECTOR_MAP = {
+    "01": "水泥", "02": "食品", "03": "塑膠", "04": "紡織",
+    "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙",
+    "10": "鋼鐵", "11": "橡膠", "12": "汽車", "13": "電子",
+    "14": "建材營造", "15": "航運", "16": "觀光", "17": "金融保險",
+    "18": "貿易百貨", "19": "綜合", "20": "其他", "21": "化學工業",
+    "22": "生技醫療", "23": "油電燃氣", "24": "半導體", "25": "電腦及週邊設備",
+    "26": "光電", "27": "通信網路", "28": "電子零組件", "29": "電子通路",
+    "30": "資訊服務", "31": "其他電子", "32": "文化創意", "33": "農業科技",
+    "34": "電子商務", "35": "綠能環保", "36": "數位雲端",
+    "37": "運動休閒", "38": "居家生活",
+    "39": "其他類", "91": "存託憑證(TDR)",
+}
 
-# Default stock universes
+
+# ============================================================
+# Static fallback lists (used if dynamic fetch fails)
+# ============================================================
 TW_TOP50 = [
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW",
     "2303.TW", "2412.TW", "2881.TW", "2882.TW", "2886.TW",
@@ -40,6 +66,326 @@ US_TOP50 = [
 ]
 
 
+# ============================================================
+# Taiwan stock universe fetcher (TWSE API)
+# ============================================================
+_tw_stock_cache: Optional[pd.DataFrame] = None
+_tw_cache_time: Optional[datetime] = None
+
+
+def fetch_tw_stock_universe(progress_callback=None) -> pd.DataFrame:
+    """Fetch all TWSE-listed stocks with market cap and sector.
+
+    Returns DataFrame with columns:
+        Code, Name, Sector, Shares, Price, MarketCap, MarketCap_Rank
+    """
+    global _tw_stock_cache, _tw_cache_time
+
+    # Cache for 1 hour
+    if _tw_stock_cache is not None and _tw_cache_time:
+        if (datetime.now() - _tw_cache_time).seconds < 3600:
+            return _tw_stock_cache.copy()
+
+    if progress_callback:
+        progress_callback(0, 3, "Fetching TW stock list...")
+
+    try:
+        # Step 1: Get company info (shares outstanding + sector)
+        url_info = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+        resp = requests.get(url_info, timeout=15)
+        resp.raise_for_status()
+        info_data = resp.json()
+        df_info = pd.DataFrame(info_data)
+
+        # Key columns: 公司代號, 公司簡稱, 產業別, 已發行普通股數或TDR原股發行股數
+        df_info = df_info.rename(columns={
+            "公司代號": "Code",
+            "公司簡稱": "Name",
+            "產業別": "Sector",
+            "已發行普通股數或TDR原股發行股數": "Shares_Raw",
+        })
+        df_info = df_info[["Code", "Name", "Sector", "Shares_Raw"]].copy()
+        df_info["Code"] = df_info["Code"].astype(str).str.strip()
+        # Parse shares - remove commas
+        df_info["Shares"] = pd.to_numeric(
+            df_info["Shares_Raw"].astype(str).str.replace(",", ""), errors="coerce"
+        )
+
+        if progress_callback:
+            progress_callback(1, 3, "Fetching TW prices...")
+
+        # Step 2: Get today's closing prices
+        time.sleep(0.5)
+        url_price = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        resp2 = requests.get(url_price, timeout=15)
+        resp2.raise_for_status()
+        price_data = resp2.json()
+        df_price = pd.DataFrame(price_data)
+
+        df_price = df_price.rename(columns={
+            "Code": "Code",
+            "Name": "Name_P",
+            "ClosingPrice": "Price_Raw",
+        })
+        df_price["Code"] = df_price["Code"].astype(str).str.strip()
+        df_price["Price"] = pd.to_numeric(
+            df_price["Price_Raw"].astype(str).str.replace(",", ""), errors="coerce"
+        )
+
+        if progress_callback:
+            progress_callback(2, 3, "Computing market caps...")
+
+        # Step 3: Merge and compute market cap
+        merged = df_info.merge(df_price[["Code", "Price"]], on="Code", how="inner")
+        merged = merged.dropna(subset=["Shares", "Price"])
+        merged = merged[merged["Price"] > 0]
+        merged["MarketCap"] = merged["Shares"] * merged["Price"]
+        merged = merged.sort_values("MarketCap", ascending=False).reset_index(drop=True)
+        merged["MarketCap_Rank"] = range(1, len(merged) + 1)
+        merged["Ticker"] = merged["Code"].apply(lambda c: f"{c}.TW")
+
+        # Map sector codes to names
+        merged["Sector"] = merged["Sector"].astype(str).str.strip().map(TW_SECTOR_MAP).fillna(merged["Sector"])
+
+        # Format market cap for display
+        merged["MarketCap_B"] = (merged["MarketCap"] / 1e8).round(1)  # 億元
+
+        _tw_stock_cache = merged
+        _tw_cache_time = datetime.now()
+
+        if progress_callback:
+            progress_callback(3, 3, "Done")
+
+        return merged.copy()
+
+    except Exception as e:
+        print(f"[WARN] Failed to fetch TW universe: {e}")
+        # Fallback: return static list with no sector info
+        return pd.DataFrame({
+            "Code": [t.replace(".TW", "") for t in TW_TOP50],
+            "Name": TW_TOP50,
+            "Sector": "未知",
+            "Ticker": TW_TOP50,
+            "MarketCap_Rank": range(1, len(TW_TOP50) + 1),
+        })
+
+
+def get_tw_sectors() -> List[str]:
+    """Get list of available TW sectors."""
+    df = fetch_tw_stock_universe()
+    if "Sector" in df.columns:
+        return sorted(df["Sector"].dropna().unique().tolist())
+    return []
+
+
+def get_tw_stocks_by_rank(rank_start: int = 1, rank_end: int = 50) -> List[str]:
+    """Get TW stock tickers by market cap rank range."""
+    df = fetch_tw_stock_universe()
+    filtered = df[(df["MarketCap_Rank"] >= rank_start) & (df["MarketCap_Rank"] <= rank_end)]
+    return filtered["Ticker"].tolist()
+
+
+def get_tw_stocks_by_sector(sectors: List[str]) -> List[str]:
+    """Get TW stock tickers by sector names."""
+    df = fetch_tw_stock_universe()
+    filtered = df[df["Sector"].isin(sectors)]
+    return filtered["Ticker"].tolist()
+
+
+# ============================================================
+# US stock universe fetcher (Wikipedia S&P 500)
+# ============================================================
+_us_stock_cache: Optional[pd.DataFrame] = None
+_us_cache_time: Optional[datetime] = None
+
+
+def fetch_us_stock_universe(progress_callback=None) -> pd.DataFrame:
+    """Fetch S&P 500 components with sector from Wikipedia + market cap from yfinance.
+
+    Returns DataFrame with columns:
+        Ticker, Name, Sector, SubIndustry, MarketCap, MarketCap_Rank
+    """
+    global _us_stock_cache, _us_cache_time
+
+    if _us_stock_cache is not None and _us_cache_time:
+        if (datetime.now() - _us_cache_time).seconds < 3600:
+            return _us_stock_cache.copy()
+
+    if progress_callback:
+        progress_callback(0, 2, "Fetching S&P 500 list...")
+
+    try:
+        # Step 1: Get S&P 500 list from Wikipedia (with User-Agent to avoid 403)
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StockAnalysisPlatform/1.0"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        tables = pd.read_html(io.StringIO(resp.text))
+        df_sp = tables[0]
+
+        df_sp = df_sp.rename(columns={
+            "Symbol": "Ticker",
+            "Security": "Name",
+            "GICS Sector": "Sector",
+            "GICS Sub-Industry": "SubIndustry",
+        })
+        df_sp = df_sp[["Ticker", "Name", "Sector", "SubIndustry"]].copy()
+        # Fix tickers (Wikipedia uses BRK.B, yfinance uses BRK-B)
+        df_sp["Ticker"] = df_sp["Ticker"].str.replace(".", "-", regex=False)
+
+        if progress_callback:
+            progress_callback(1, 2, "Sorting by market cap...")
+
+        # Step 2: Use a known approximate market cap ranking
+        # (fetching 500 market caps from yfinance is too slow ~10min)
+        # Instead, we use Wikipedia's table order which is roughly by market cap
+        # and supplement with a quick batch download of latest prices
+        # The S&P 500 Wikipedia table lists companies alphabetically, so we use
+        # a known top-by-market-cap ordering for the top ~100
+        _top_by_mcap = [
+            "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "LLY",
+            "AVGO", "TSLA", "WMT", "JPM", "V", "UNH", "XOM", "MA", "ORCL",
+            "COST", "PG", "JNJ", "HD", "NFLX", "ABBV", "BAC", "CRM", "KO",
+            "CVX", "MRK", "AMD", "SAP", "PEP", "TMO", "ADBE", "CSCO", "ACN",
+            "LIN", "WFC", "MCD", "ABT", "TXN", "IBM", "PM", "GE", "DHR",
+            "ISRG", "QCOM", "AMGN", "INTU", "CAT", "VZ", "AMAT", "NOW",
+            "GS", "BKNG", "T", "SPGI", "AXP", "BA", "NEE", "MS", "LOW",
+            "PFE", "RTX", "BLK", "TJX", "UNP", "DE", "UBER", "SYK", "SCHW",
+        ]
+        # Assign rank: known top companies first, rest alphabetically after
+        rank_map = {t: i + 1 for i, t in enumerate(_top_by_mcap)}
+        next_rank = len(_top_by_mcap) + 1
+        for t in df_sp["Ticker"]:
+            if t not in rank_map:
+                rank_map[t] = next_rank
+                next_rank += 1
+
+        df_sp["MarketCap_Rank"] = df_sp["Ticker"].map(rank_map)
+        df_sp = df_sp.sort_values("MarketCap_Rank").reset_index(drop=True)
+        df_sp["MarketCap_Rank"] = range(1, len(df_sp) + 1)
+        df_sp["MarketCap"] = 0  # placeholder
+        df_sp["MarketCap_B"] = 0
+
+        _us_stock_cache = df_sp
+        _us_cache_time = datetime.now()
+
+        if progress_callback:
+            progress_callback(2, 2, "Done")
+
+        return df_sp.copy()
+
+    except Exception as e:
+        print(f"[WARN] Failed to fetch US universe: {e}")
+        # Fallback
+        return pd.DataFrame({
+            "Ticker": US_TOP50,
+            "Name": US_TOP50,
+            "Sector": "Unknown",
+            "MarketCap_Rank": range(1, len(US_TOP50) + 1),
+        })
+
+
+def get_us_sectors() -> List[str]:
+    """Get list of available US GICS sectors."""
+    df = fetch_us_stock_universe()
+    if "Sector" in df.columns:
+        return sorted(df["Sector"].dropna().unique().tolist())
+    return []
+
+
+def get_us_stocks_by_rank(rank_start: int = 1, rank_end: int = 50) -> List[str]:
+    """Get US stock tickers by market cap rank range."""
+    df = fetch_us_stock_universe()
+    filtered = df[(df["MarketCap_Rank"] >= rank_start) & (df["MarketCap_Rank"] <= rank_end)]
+    return filtered["Ticker"].tolist()
+
+
+def get_us_stocks_by_sector(sectors: List[str]) -> List[str]:
+    """Get US stock tickers by sector names."""
+    df = fetch_us_stock_universe()
+    filtered = df[df["Sector"].isin(sectors)]
+    return filtered["Ticker"].tolist()
+
+
+# ============================================================
+# Sector momentum analysis
+# ============================================================
+def analyze_sector_momentum(
+    market: str = "TW",
+    period: str = "1mo",
+    progress_callback=None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Analyze momentum at sector level, then stock level within each sector.
+
+    Returns:
+        sector_df: DataFrame with sector-level momentum (Sector, Avg_Return%, Stocks, Top_Stock)
+        stock_df: DataFrame with all stocks including Sector column
+    """
+    # Get universe
+    if market == "TW":
+        universe = fetch_tw_stock_universe()
+        ticker_col = "Ticker"
+    else:
+        universe = fetch_us_stock_universe()
+        ticker_col = "Ticker"
+
+    if universe.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    all_tickers = universe[ticker_col].tolist()
+
+    # Screen momentum for all stocks
+    stock_df = screen_momentum(all_tickers, period=period, progress_callback=progress_callback)
+
+    if stock_df.empty:
+        return pd.DataFrame(), stock_df
+
+    # Merge sector info
+    if market == "TW":
+        sector_map = dict(zip(universe["Ticker"], universe["Sector"]))
+    else:
+        sector_map = dict(zip(universe["Ticker"], universe["Sector"]))
+
+    stock_df["Sector"] = stock_df["Ticker"].map(sector_map).fillna("Other")
+
+    # Sector-level aggregation
+    sector_agg = stock_df.groupby("Sector").agg(
+        Avg_Return=("Return_Pct", "mean"),
+        Median_Return=("Return_Pct", "median"),
+        Stock_Count=("Ticker", "count"),
+        Strong_Count=("Strength", lambda x: (x == "Strong").sum()),
+        Weak_Count=("Strength", lambda x: (x == "Weak").sum()),
+        Best_Return=("Return_Pct", "max"),
+        Worst_Return=("Return_Pct", "min"),
+    ).reset_index()
+
+    # Find top stock per sector
+    top_per_sector = stock_df.loc[stock_df.groupby("Sector")["Return_Pct"].idxmax()]
+    top_map = dict(zip(top_per_sector["Sector"],
+                       top_per_sector["Ticker"] + " (" + top_per_sector["Return_Pct"].round(1).astype(str) + "%)"))
+    sector_agg["Top_Stock"] = sector_agg["Sector"].map(top_map)
+
+    # Round and sort
+    sector_agg["Avg_Return"] = sector_agg["Avg_Return"].round(2)
+    sector_agg["Median_Return"] = sector_agg["Median_Return"].round(2)
+    sector_agg["Best_Return"] = sector_agg["Best_Return"].round(2)
+    sector_agg["Worst_Return"] = sector_agg["Worst_Return"].round(2)
+    sector_agg = sector_agg.sort_values("Avg_Return", ascending=False).reset_index(drop=True)
+
+    # Sector strength
+    q75 = sector_agg["Avg_Return"].quantile(0.75) if len(sector_agg) > 3 else 0
+    q25 = sector_agg["Avg_Return"].quantile(0.25) if len(sector_agg) > 3 else 0
+    sector_agg["Strength"] = sector_agg["Avg_Return"].apply(
+        lambda x: "Strong" if x >= q75 else "Weak" if x <= q25 else "Neutral"
+    )
+    sector_agg["Rank"] = range(1, len(sector_agg) + 1)
+
+    return sector_agg, stock_df
+
+
+# ============================================================
+# Core momentum screening (unchanged interface, added Sector)
+# ============================================================
 def screen_momentum(
     tickers: List[str],
     period: str = "1mo",
@@ -53,8 +399,7 @@ def screen_momentum(
         progress_callback: fn(current, total, ticker)
 
     Returns:
-        DataFrame sorted by return% descending with columns:
-        Ticker, Name, Price, Return%, Volume_Change%, RSI, Relative_Strength, Rank
+        DataFrame sorted by return% descending
     """
     total = len(tickers)
     results = []
@@ -158,21 +503,21 @@ def _compute_momentum_single(ticker: str, all_data: pd.DataFrame, period: str) -
         elif gain > 0:
             rsi = 100
 
-    # Name from ticker
+    # Name
+    name = ticker
     try:
         info = yf.Ticker(ticker).info
         name = info.get("shortName", ticker) if info else ticker
     except Exception:
-        name = ticker
+        pass
 
-    # 52-week position
-    high_52w = close.max()
-    low_52w = close.min()
-    pct_from_high = (latest - high_52w) / high_52w * 100 if high_52w > 0 else 0
+    # Position from period high
+    high_period = close.max()
+    pct_from_high = (latest - high_period) / high_period * 100 if high_period > 0 else 0
 
     return {
         "Ticker": ticker,
-        "Name": name[:20] if name else ticker,
+        "Name": name[:25] if name else ticker,
         "Price": round(latest, 2),
         "Return_Pct": round(return_pct, 2),
         "Vol_Change_Pct": round(vol_change, 1) if vol_change is not None else None,
@@ -181,6 +526,9 @@ def _compute_momentum_single(ticker: str, all_data: pd.DataFrame, period: str) -
     }
 
 
+# ============================================================
+# Excel export
+# ============================================================
 def export_momentum_excel(df: pd.DataFrame, period: str) -> bytes:
     """Export momentum screening to styled Excel."""
     output = io.BytesIO()
@@ -215,5 +563,43 @@ def export_momentum_excel(df: pd.DataFrame, period: str) -> bytes:
 
         ws.freeze_panes(1, 2)
         ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+    return output.getvalue()
+
+
+def export_sector_momentum_excel(sector_df: pd.DataFrame, stock_df: pd.DataFrame, period: str) -> bytes:
+    """Export sector + stock momentum to multi-sheet Excel."""
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        sector_df.to_excel(writer, sheet_name="Sector_Momentum", index=False)
+        stock_df.to_excel(writer, sheet_name="Stock_Detail", index=False)
+
+        wb = writer.book
+        header_fmt = wb.add_format({
+            "bold": True, "bg_color": "#1a1a2e", "font_color": "#00d4aa",
+            "border": 1, "text_wrap": True,
+        })
+        strong_fmt = wb.add_format({"bg_color": "#1b5e20", "font_color": "white"})
+        weak_fmt = wb.add_format({"bg_color": "#b71c1c", "font_color": "white"})
+
+        for sheet_name in ["Sector_Momentum", "Stock_Detail"]:
+            ws = writer.sheets[sheet_name]
+            df = sector_df if sheet_name == "Sector_Momentum" else stock_df
+            for col_num, value in enumerate(df.columns):
+                ws.write(0, col_num, value, header_fmt)
+            for i, col in enumerate(df.columns):
+                max_len = max(df[col].astype(str).map(len).max() if len(df) > 0 else 0, len(col))
+                ws.set_column(i, i, min(max_len + 2, 30))
+            if "Strength" in df.columns:
+                s_col = df.columns.get_loc("Strength")
+                for row_idx in range(len(df)):
+                    val = df.iloc[row_idx]["Strength"]
+                    if val == "Strong":
+                        ws.write(row_idx + 1, s_col, val, strong_fmt)
+                    elif val == "Weak":
+                        ws.write(row_idx + 1, s_col, val, weak_fmt)
+            ws.freeze_panes(1, 2)
+            ws.autofilter(0, 0, len(df), len(df.columns) - 1)
 
     return output.getvalue()

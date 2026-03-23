@@ -37,7 +37,17 @@ from utils.constants import (
 )
 from utils.helpers import run_backtest_simple, run_backtest_advanced, compute_daily_scores
 from utils.batch_analysis import batch_analyze, export_to_excel
-from utils.momentum import screen_momentum, export_momentum_excel, TW_TOP50, US_TOP50
+from utils.momentum import (
+    screen_momentum, export_momentum_excel, export_sector_momentum_excel,
+    TW_TOP50, US_TOP50,
+    fetch_tw_stock_universe, fetch_us_stock_universe,
+    get_tw_sectors, get_us_sectors,
+    get_tw_stocks_by_rank, get_us_stocks_by_rank,
+    get_tw_stocks_by_sector, get_us_stocks_by_sector,
+    analyze_sector_momentum,
+)
+from utils.sentiment import get_all_sentiment_indicators, sentiment_label
+from utils.risk_monitor import get_full_risk_assessment
 
 # ============================================================
 # Page Config & Custom CSS
@@ -386,20 +396,21 @@ if analyze_btn or "analyzed" in st.session_state:
         tech_signals = get_latest_signals(df_indicators)
         fund_analysis = analyze_fundamentals(fundamentals_raw)
 
-        # Chip data (TW only)
+        # Chip data (TW only) — lazy loaded in Chip Analysis tab
         inst_data = {}
         margin_data = {}
+        inst_df = pd.DataFrame()
+        margin_df = pd.DataFrame()
         market = get_market(ticker)
-        if market in ("TW", "TWO"):
-            # Only fetch last 20 trading days for chip data to avoid rate limiting
+
+        # Check if chip data was already loaded (from a previous click)
+        chip_cache_key = f"chip_loaded_{ticker}_{end_str}"
+        if st.session_state.get(chip_cache_key):
             chip_start = (end_date - timedelta(days=35)).strftime("%Y-%m-%d")
             inst_df = DataStore.get_institutional_data(ticker, chip_start, end_str)
             margin_df = DataStore.get_margin_data(ticker, chip_start, end_str)
             inst_data = analyze_institutional(inst_df)
             margin_data = analyze_margin(margin_df)
-        else:
-            inst_df = pd.DataFrame()
-            margin_df = pd.DataFrame()
 
         # Quantitative metrics
         bench_ticker = get_default_index(ticker)
@@ -416,6 +427,93 @@ if analyze_btn or "analyzed" in st.session_state:
         highlights, risks = generate_highlights_risks(all_scores)
 
     # ============================================================
+    # Momentum result renderer (shared by stock screening modes)
+    # ============================================================
+    def _render_momentum_results(st_mod, mom_df, period_key, colors):
+        """Render momentum screening results with charts and tables."""
+        import plotly.graph_objects as go
+
+        strong = mom_df[mom_df["Strength"] == "Strong"]
+        weak = mom_df[mom_df["Strength"] == "Weak"]
+        avg_ret = mom_df["Return_Pct"].mean()
+
+        st_mod.success(f"Screening complete! {len(mom_df)} stocks.")
+
+        ms1, ms2, ms3, ms4 = st_mod.columns(4)
+        with ms1: st_mod.metric("Avg Return", f"{avg_ret:.2f}%")
+        with ms2: st_mod.metric("Strong Stocks", len(strong))
+        with ms3: st_mod.metric("Weak Stocks", len(weak))
+        with ms4: st_mod.metric("Total", len(mom_df))
+
+        # Bar chart
+        top_n = min(30, len(mom_df))
+        chart_df = mom_df.head(top_n)
+        bar_colors = [colors["positive"] if r >= 0 else colors["negative"]
+                      for r in chart_df["Return_Pct"]]
+
+        fig_mom = go.Figure(go.Bar(
+            x=chart_df["Return_Pct"],
+            y=chart_df["Ticker"],
+            orientation="h",
+            marker_color=bar_colors,
+            text=[f"{r:+.1f}%" for r in chart_df["Return_Pct"]],
+            textposition="outside",
+            textfont=dict(color=colors["text_primary"], size=10),
+        ))
+        fig_mom.update_layout(
+            paper_bgcolor=colors["bg_primary"],
+            plot_bgcolor=colors["bg_primary"],
+            font=dict(color=colors["text_primary"]),
+            title=dict(text=f"Momentum Ranking ({period_key})",
+                      font=dict(color=colors["accent"])),
+            height=max(top_n * 25, 400),
+            margin=dict(l=80, r=60, t=50, b=30),
+            yaxis=dict(autorange="reversed", gridcolor=colors["border"]),
+            xaxis=dict(title="Return %", gridcolor=colors["border"]),
+        )
+        st_mod.plotly_chart(fig_mom, use_container_width=True)
+
+        # Full table
+        st_mod.markdown("#### Full Results 完整結果")
+        st_mod.dataframe(mom_df, use_container_width=True, hide_index=True,
+                        height=min(len(mom_df) * 38 + 40, 500))
+
+        # Download Excel
+        excel_bytes = export_momentum_excel(mom_df, period_key)
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        st_mod.download_button(
+            label="📥 Download Excel",
+            data=excel_bytes,
+            file_name=f"momentum_{period_key}_{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_mom",
+        )
+
+        # Strong & weak picks
+        col_s, col_w = st_mod.columns(2)
+        with col_s:
+            st_mod.markdown(f"#### 🟢 Strong 強勢股 (Top 25%)")
+            if not strong.empty:
+                for _, row in strong.head(10).iterrows():
+                    st_mod.markdown(f"""
+                    <div class="highlight-box">
+                        <strong>{row['Ticker']}</strong> {row.get('Name', '')} —
+                        <span style="color:{colors['positive']}">{row['Return_Pct']:+.2f}%</span>
+                        | RSI: {row.get('RSI', 'N/A')} | Rank #{row.get('Rank', '')}
+                    </div>
+                    """, unsafe_allow_html=True)
+        with col_w:
+            st_mod.markdown(f"#### 🔴 Weak 弱勢股 (Bottom 25%)")
+            if not weak.empty:
+                for _, row in weak.tail(10).iterrows():
+                    st_mod.markdown(f"""
+                    <div class="risk-box">
+                        <strong>{row['Ticker']}</strong> {row.get('Name', '')} —
+                        <span style="color:{colors['negative']}">{row['Return_Pct']:+.2f}%</span>
+                        | RSI: {row.get('RSI', 'N/A')} | Rank #{row.get('Rank', '')}
+                    </div>
+                    """, unsafe_allow_html=True)
+
     # Backtest result renderer (shared by all modes)
     # ============================================================
     def _render_backtest_results(st_mod, bt_result, df_ind, strat_info, colors):
@@ -616,10 +714,11 @@ if analyze_btn or "analyzed" in st.session_state:
     # ============================================================
     # Tabs
     # ============================================================
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊 Dashboard", "📈 Technical", "📋 Fundamental",
         "🏦 Chip Analysis", "📉 Market Compare", "🔄 Backtest",
         "📋 Batch Analysis", "🚀 Momentum",
+        "🎯 Sentiment", "⚠️ Risk Radar",
     ])
 
     # ==================== TAB 1: DASHBOARD ====================
@@ -906,32 +1005,64 @@ if analyze_btn or "analyzed" in st.session_state:
             """, unsafe_allow_html=True)
 
         if market in ("TW", "TWO"):
-            if not inst_df.empty:
-                fig_inst = chip_charts.create_institutional_chart(inst_df)
-                st.plotly_chart(fig_inst, use_container_width=True)
+            chip_loaded = st.session_state.get(chip_cache_key, False)
 
-                # Summary metrics
-                st.markdown("#### Institutional Summary 法人摘要")
-                inst_cols = st.columns(4)
-                for i, (key, data) in enumerate(inst_data.items()):
-                    with inst_cols[i % 4]:
-                        st.metric(
-                            data.get("label", key),
-                            data.get("display", "N/A"),
-                        )
+            if not chip_loaded:
+                st.markdown(f"""
+                <div style="background:{COLORS['bg_card']}; border:1px solid {COLORS['border']};
+                            border-radius:8px; padding:20px; margin:10px 0; text-align:center;">
+                    <div style="color:{COLORS['text_primary']}; font-size:1.1em; margin-bottom:8px;">
+                        籌碼面資料需要從證交所 (TWSE) 逐日下載，約需 40-80 秒
+                    </div>
+                    <div style="color:{COLORS['text_secondary']}; font-size:0.9em;">
+                        資料包含：三大法人買賣超 + 融資融券 (最近 20 個交易日)
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if st.button("📥 Load Chip Data 載入籌碼面資料", key="load_chip", type="primary"):
+                    chip_start = (end_date - timedelta(days=35)).strftime("%Y-%m-%d")
+                    inst_df = DataStore.get_institutional_data(ticker, chip_start, end_str)
+                    margin_df = DataStore.get_margin_data(ticker, chip_start, end_str)
+                    inst_data = analyze_institutional(inst_df)
+                    margin_data = analyze_margin(margin_df)
+                    st.session_state[chip_cache_key] = True
+
+                    # Re-compute scores with chip data
+                    all_scores = compute_all_scores(
+                        tech_signals, fund_analysis, inst_data, margin_data, quant_data,
+                        enabled_indicators,
+                    )
+                    composite_score = compute_composite(all_scores, weights)
+                    st.rerun()
             else:
-                st.info("⏳ Institutional data requires TWSE API calls with rate limiting. Data may take a moment to load for the selected date range.")
+                # Data already loaded — show it
+                if not inst_df.empty:
+                    fig_inst = chip_charts.create_institutional_chart(inst_df)
+                    st.plotly_chart(fig_inst, use_container_width=True)
 
-            if not margin_df.empty:
-                fig_margin = chip_charts.create_margin_chart(margin_df)
-                st.plotly_chart(fig_margin, use_container_width=True)
+                    st.markdown("#### Institutional Summary 法人摘要")
+                    inst_cols = st.columns(4)
+                    for i, (key, data) in enumerate(inst_data.items()):
+                        with inst_cols[i % 4]:
+                            st.metric(
+                                data.get("label", key),
+                                data.get("display", "N/A"),
+                            )
+                else:
+                    st.info("No institutional data returned for this date range.")
 
-                # Margin metrics
-                st.markdown("#### Margin Summary 融資融券摘要")
-                m_cols = st.columns(3)
-                for i, (key, data) in enumerate(margin_data.items()):
-                    with m_cols[i % 3]:
-                        st.metric(data.get("label", key), data.get("display", "N/A"))
+                if not margin_df.empty:
+                    fig_margin = chip_charts.create_margin_chart(margin_df)
+                    st.plotly_chart(fig_margin, use_container_width=True)
+
+                    st.markdown("#### Margin Summary 融資融券摘要")
+                    m_cols = st.columns(3)
+                    for i, (key, data) in enumerate(margin_data.items()):
+                        with m_cols[i % 3]:
+                            st.metric(data.get("label", key), data.get("display", "N/A"))
+                else:
+                    st.info("No margin data returned for this date range.")
         else:
             st.info("Chip analysis is primarily available for Taiwan stocks. For US stocks, quantitative metrics (Beta, Sharpe, Alpha) are shown below.")
 
@@ -1265,157 +1396,555 @@ if analyze_btn or "analyzed" in st.session_state:
     # ==================== TAB 8: MOMENTUM SCREENING ====================
     with tab8:
         st.markdown("### Momentum Screening 動能篩選")
-        st.markdown("""
-        分析一組股票在不同時間區間的漲跌幅，找出**強勢股**與**弱勢股**，
-        方便動能交易 (Momentum Trading) 選股。
-        """)
+        st.markdown("分析股票/產業在不同時間區間的漲跌幅，找出**強勢股**與**弱勢股**。")
 
         with st.expander("📖 使用說明"):
             st.markdown(f"""
 <div class="indicator-desc">
 <strong>動能交易 (Momentum Trading) 原理:</strong><br>
 近期表現強勢的股票傾向繼續走強，弱勢的傾向繼續走弱。做多強勢股、避開弱勢股。<br><br>
-<strong>如何使用:</strong><br>
-1. 選擇股票清單 (台股/美股 Top 50，或自訂)<br>
-2. 選擇分析期間 (今日/本週/本月/3個月/6個月/1年)<br>
-3. 結果按漲幅排序，Top 25% = <span style="color:{COLORS['positive']}">Strong 強勢</span>，
-   Bottom 25% = <span style="color:{COLORS['negative']}">Weak 弱勢</span><br><br>
+<strong>兩種模式:</strong><br>
+<strong>1. Stock Screening 個股篩選</strong> — 從市值排名或自訂清單中篩選強弱勢個股<br>
+<strong>2. Sector Analysis 產業分析</strong> — 先看哪個產業動能最強，再展開看該產業的個股<br><br>
+<strong>Stock Screening 選股方式:</strong><br>
+- <strong>By Market Cap Rank 市值排名</strong>: 輸入排名區間 (如 1-50, 51-100)，系統自動從 TWSE/S&P500 取得對應股票<br>
+- <strong>By Sector 產業別</strong>: 勾選想看的產業，篩選該產業所有股票<br>
+- <strong>Custom 自訂</strong>: 直接輸入股票代號<br><br>
 <strong>各欄位說明:</strong><br>
 - <strong>Return%</strong>: 該期間的漲跌幅<br>
-- <strong>Vol Change%</strong>: 成交量相對變化 (正 = 放量，負 = 縮量)<br>
-- <strong>RSI</strong>: 近期相對強弱<br>
-- <strong>% From High</strong>: 距離期間最高點的跌幅 (0% = 在高點)<br>
-- <strong>Percentile</strong>: 在所有股票中的百分位排名 (100 = 最強)<br>
+- <strong>Vol Change%</strong>: 成交量變化 (正=放量, 負=縮量)<br>
+- <strong>RSI</strong>: 相對強弱指標<br>
+- <strong>% From High</strong>: 距離期間最高點的跌幅<br>
+- <strong>Percentile</strong>: 百分位排名 (100=最強)<br>
 - <strong>Strength</strong>: Strong (Top 25%) / Neutral / Weak (Bottom 25%)
 </div>
             """, unsafe_allow_html=True)
 
-        # Stock universe selection
-        mu1, mu2 = st.columns(2)
-        with mu1:
-            universe = st.radio("Stock Universe 股票清單", [
-                "台股 Top 50", "美股 Top 50", "Custom 自訂"
-            ], horizontal=True, key="mom_universe")
-        with mu2:
-            mom_period = st.selectbox("Period 分析期間", [
-                "1d (Today 今日)", "5d (This Week 本週)", "1mo (This Month 本月)",
-                "3mo (3 Months)", "6mo (6 Months)", "1y (1 Year)",
-            ], index=2, key="mom_period")
+        # Mode selection
+        mom_mode = st.radio(
+            "Mode 模式",
+            ["Stock Screening 個股篩選", "Sector Analysis 產業分析"],
+            horizontal=True, key="mom_mode"
+        )
 
+        # Period (shared)
+        mom_period = st.selectbox("Period 分析期間", [
+            "1d (Today 今日)", "5d (This Week 本週)", "1mo (This Month 本月)",
+            "3mo (3 Months)", "6mo (6 Months)", "1y (1 Year)",
+        ], index=2, key="mom_period")
         period_key = mom_period.split(" ")[0]
 
-        if universe == "Custom 自訂":
-            custom_mom = st.text_area(
-                "Custom tickers (comma or newline separated)",
-                value="2330.TW, 2317.TW, 2454.TW, AAPL, NVDA, TSLA",
-                key="mom_custom",
-            )
-            raw = custom_mom.replace(",", "\n").replace(" ", "\n")
-            mom_tickers = [t.strip().upper() for t in raw.split("\n") if t.strip()]
-            mom_tickers = [f"{t}.TW" if t.isdigit() else t for t in mom_tickers]
-        elif universe.startswith("台股"):
-            mom_tickers = TW_TOP50
+        # ---- STOCK SCREENING MODE ----
+        if mom_mode.startswith("Stock"):
+            mu1, mu2 = st.columns(2)
+            with mu1:
+                mom_market = st.radio("Market 市場", ["台股 TW", "美股 US"], horizontal=True, key="mom_mkt")
+            with mu2:
+                selection_mode = st.radio("Selection 選股方式", [
+                    "By Market Cap Rank 市值排名",
+                    "By Sector 產業別",
+                    "Custom 自訂",
+                ], key="mom_sel")
+
+            is_tw_mom = mom_market.startswith("台股")
+            mom_tickers = []
+
+            if selection_mode.startswith("By Market"):
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    rank_start = st.number_input("From Rank 從第幾名", min_value=1, max_value=500, value=1, key="rank_s")
+                with rc2:
+                    rank_end = st.number_input("To Rank 到第幾名", min_value=1, max_value=500, value=50, key="rank_e")
+
+                if rank_start > rank_end:
+                    rank_start, rank_end = rank_end, rank_start
+
+                st.caption(f"Will fetch stocks ranked #{rank_start} to #{rank_end} by market cap")
+
+                if st.button("🚀 Run Screening", key="run_mom_rank", type="primary"):
+                    with st.spinner(f"Fetching {'TWSE' if is_tw_mom else 'S&P 500'} stock universe..."):
+                        if is_tw_mom:
+                            mom_tickers = get_tw_stocks_by_rank(rank_start, rank_end)
+                        else:
+                            mom_tickers = get_us_stocks_by_rank(rank_start, rank_end)
+
+                    if mom_tickers:
+                        st.info(f"Got {len(mom_tickers)} stocks (rank #{rank_start}-#{rank_end}). Screening...")
+                    else:
+                        st.warning("Could not fetch stock list. Using fallback Top 50.")
+                        mom_tickers = TW_TOP50 if is_tw_mom else US_TOP50
+
+            elif selection_mode.startswith("By Sector"):
+                with st.spinner("Loading sectors..."):
+                    if is_tw_mom:
+                        available_sectors = get_tw_sectors()
+                    else:
+                        available_sectors = get_us_sectors()
+
+                if available_sectors:
+                    selected_sectors = st.multiselect(
+                        "Select Sectors 選擇產業",
+                        available_sectors,
+                        default=available_sectors[:3] if len(available_sectors) >= 3 else available_sectors,
+                        key="mom_sectors",
+                    )
+                    if st.button("🚀 Run Screening", key="run_mom_sector", type="primary"):
+                        if selected_sectors:
+                            with st.spinner("Fetching stocks..."):
+                                if is_tw_mom:
+                                    mom_tickers = get_tw_stocks_by_sector(selected_sectors)
+                                else:
+                                    mom_tickers = get_us_stocks_by_sector(selected_sectors)
+                            st.info(f"Got {len(mom_tickers)} stocks from {len(selected_sectors)} sectors.")
+                        else:
+                            st.warning("Please select at least one sector.")
+                else:
+                    st.warning("Could not load sector list. Using fallback.")
+                    mom_tickers = TW_TOP50 if is_tw_mom else US_TOP50
+
+            else:  # Custom
+                custom_mom = st.text_area(
+                    "Custom tickers (comma or newline separated)",
+                    value="2330.TW, 2317.TW, 2454.TW, AAPL, NVDA, TSLA",
+                    key="mom_custom",
+                )
+                if st.button("🚀 Run Screening", key="run_mom_custom", type="primary"):
+                    raw = custom_mom.replace(",", "\n").replace(" ", "\n")
+                    mom_tickers = [t.strip().upper() for t in raw.split("\n") if t.strip()]
+                    mom_tickers = [f"{t}.TW" if t.isdigit() else t for t in mom_tickers]
+
+            # Run stock screening
+            if mom_tickers:
+                progress = st.progress(0, text="Downloading data...")
+
+                def mom_progress(curr, total, tkr):
+                    if total > 0:
+                        progress.progress(min(curr / total, 1.0),
+                                         text=f"Analyzing {tkr}... ({curr}/{total})")
+
+                mom_df = screen_momentum(mom_tickers, period=period_key, progress_callback=mom_progress)
+                progress.empty()
+
+                if not mom_df.empty:
+                    _render_momentum_results(st, mom_df, period_key, COLORS)
+                else:
+                    st.error("No results. Check ticker symbols or try again.")
+
+        # ---- SECTOR ANALYSIS MODE ----
         else:
-            mom_tickers = US_TOP50
+            sa_market = st.radio("Market 市場", ["台股 TW", "美股 US"], horizontal=True, key="sa_mkt")
+            is_tw_sa = sa_market.startswith("台股")
 
-        if st.button("🚀 Run Momentum Screening", key="run_mom", type="primary"):
-            st.info(f"Screening {len(mom_tickers)} stocks ({period_key})...")
-            progress = st.progress(0, text="Downloading data...")
+            if st.button("🚀 Run Sector Analysis", key="run_sector", type="primary"):
+                progress = st.progress(0, text="Fetching universe...")
 
-            def mom_progress(curr, total, ticker):
+                def sa_progress(curr, total, tkr):
+                    if total > 0:
+                        progress.progress(min(curr / total, 1.0),
+                                         text=f"Analyzing {tkr}... ({curr}/{total})")
+
+                market_code = "TW" if is_tw_sa else "US"
+                sector_df, stock_df = analyze_sector_momentum(
+                    market=market_code, period=period_key, progress_callback=sa_progress
+                )
+                progress.empty()
+
+                if not sector_df.empty:
+                    st.success(f"Sector analysis complete! {len(sector_df)} sectors, {len(stock_df)} stocks.")
+
+                    # Sector bar chart
+                    import plotly.graph_objects as go
+                    bar_colors = [COLORS["positive"] if r >= 0 else COLORS["negative"]
+                                  for r in sector_df["Avg_Return"]]
+
+                    fig_sector = go.Figure(go.Bar(
+                        x=sector_df["Avg_Return"],
+                        y=sector_df["Sector"],
+                        orientation="h",
+                        marker_color=bar_colors,
+                        text=[f"{r:+.2f}%" for r in sector_df["Avg_Return"]],
+                        textposition="outside",
+                        textfont=dict(color=COLORS["text_primary"], size=11),
+                    ))
+                    fig_sector.update_layout(
+                        paper_bgcolor=COLORS["bg_primary"],
+                        plot_bgcolor=COLORS["bg_primary"],
+                        font=dict(color=COLORS["text_primary"]),
+                        title=dict(text=f"Sector Momentum ({period_key}) — Avg Return %",
+                                  font=dict(color=COLORS["accent"], size=16)),
+                        height=max(len(sector_df) * 30, 400),
+                        margin=dict(l=150, r=80, t=50, b=30),
+                        yaxis=dict(autorange="reversed", gridcolor=COLORS["border"]),
+                        xaxis=dict(title="Avg Return %", gridcolor=COLORS["border"]),
+                    )
+                    st.plotly_chart(fig_sector, use_container_width=True)
+
+                    # Sector summary table
+                    st.markdown("#### Sector Ranking 產業排行")
+                    st.dataframe(sector_df, use_container_width=True, hide_index=True)
+
+                    # Drill-down: select a sector to see its stocks
+                    st.markdown("---")
+                    st.markdown("#### Drill Down 展開產業個股")
+                    strong_sectors = sector_df[sector_df["Strength"] == "Strong"]["Sector"].tolist()
+                    all_sectors = sector_df["Sector"].tolist()
+
+                    drill_sector = st.selectbox(
+                        "Select a sector to view stocks 選擇產業查看個股",
+                        all_sectors,
+                        index=0,
+                        key="drill_sector",
+                    )
+
+                    if drill_sector and not stock_df.empty:
+                        sector_stocks = stock_df[stock_df["Sector"] == drill_sector].copy()
+                        if not sector_stocks.empty:
+                            sector_stocks = sector_stocks.sort_values("Return_Pct", ascending=False)
+                            st.markdown(f"**{drill_sector}** — {len(sector_stocks)} stocks")
+
+                            # Mini bar chart for this sector's stocks
+                            top_n = min(20, len(sector_stocks))
+                            chart_ss = sector_stocks.head(top_n)
+                            ss_colors = [COLORS["positive"] if r >= 0 else COLORS["negative"]
+                                        for r in chart_ss["Return_Pct"]]
+
+                            fig_ss = go.Figure(go.Bar(
+                                x=chart_ss["Return_Pct"],
+                                y=chart_ss["Ticker"],
+                                orientation="h",
+                                marker_color=ss_colors,
+                                text=[f"{r:+.1f}%" for r in chart_ss["Return_Pct"]],
+                                textposition="outside",
+                                textfont=dict(color=COLORS["text_primary"], size=10),
+                            ))
+                            fig_ss.update_layout(
+                                paper_bgcolor=COLORS["bg_primary"],
+                                plot_bgcolor=COLORS["bg_primary"],
+                                font=dict(color=COLORS["text_primary"]),
+                                title=dict(text=f"{drill_sector} — Stock Momentum",
+                                          font=dict(color=COLORS["accent"])),
+                                height=max(top_n * 28, 300),
+                                margin=dict(l=80, r=60, t=40, b=20),
+                                yaxis=dict(autorange="reversed", gridcolor=COLORS["border"]),
+                                xaxis=dict(title="Return %", gridcolor=COLORS["border"]),
+                            )
+                            st.plotly_chart(fig_ss, use_container_width=True)
+
+                            st.dataframe(sector_stocks, use_container_width=True, hide_index=True)
+
+                    # Download
+                    excel_bytes = export_sector_momentum_excel(sector_df, stock_df, period_key)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M")
+                    st.download_button(
+                        label="📥 Download Excel (Sectors + Stocks)",
+                        data=excel_bytes,
+                        file_name=f"sector_momentum_{period_key}_{ts}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_sector_mom",
+                    )
+                else:
+                    st.error("No sector data available.")
+
+    # ==================== TAB 9: MARKET SENTIMENT ====================
+    with tab9:
+        st.markdown("### Market Sentiment 市場情緒")
+        st.markdown("綜合多項指標判斷目前市場處於 **恐懼 (Fear)** 還是 **貪婪 (Greed)** 狀態。")
+
+        with st.expander("📖 使用說明"):
+            st.markdown(f"""
+<div class="indicator-desc">
+<strong>Fear & Greed 恐懼與貪婪指數 (0-100):</strong><br>
+0 = 極度恐懼 (Extreme Fear) — 市場恐慌，往往是買入機會<br>
+50 = 中性 (Neutral)<br>
+100 = 極度貪婪 (Extreme Greed) — 市場過熱，注意風險<br><br>
+<strong>綜合以下 10 項指標:</strong><br>
+1. <strong>VIX 恐慌指數</strong> (20%) — CBOE 波動率指數<br>
+2. <strong>S&P 500 Momentum</strong> (15%) — 相對 125 日均線位置<br>
+3. <strong>Put/Call Ratio</strong> (15%) — CBOE 選擇權看跌/看漲比<br>
+4. <strong>Safe Haven Demand</strong> (10%) — 股票 vs 債券資金流向<br>
+5. <strong>Market Breadth</strong> (10%) — 上漲/下跌產業比例<br>
+6. <strong>Yield Curve</strong> (10%) — 殖利率曲線 (倒掛=恐懼)<br>
+7. <strong>Gold</strong> (5%) — 黃金避險需求<br>
+8. <strong>USD Strength</strong> (5%) — 美元強度 (Risk-Off指標)<br>
+9. <strong>TAIEX 台股情緒</strong> (5%) — 加權指數 vs 均線<br>
+10. <strong>Crypto Fear & Greed</strong> (5%) — 加密市場情緒<br><br>
+<strong>如何使用:</strong> 恐懼時別人恐懼我貪婪 (巴菲特)。極端值通常是反向指標。
+</div>
+            """, unsafe_allow_html=True)
+
+        if st.button("🎯 Analyze Market Sentiment", key="run_sentiment", type="primary"):
+            progress = st.progress(0, text="Fetching sentiment data...")
+
+            def sent_progress(curr, total, name):
                 if total > 0:
-                    progress.progress(min(curr / total, 1.0),
-                                     text=f"Analyzing {ticker}... ({curr}/{total})")
+                    progress.progress(min(curr / total, 1.0), text=f"Fetching {name}... ({curr}/{total})")
 
-            mom_df = screen_momentum(mom_tickers, period=period_key, progress_callback=mom_progress)
+            composite_score, indicators = get_all_sentiment_indicators(progress_callback=sent_progress)
             progress.empty()
 
-            if not mom_df.empty:
-                st.success(f"Screening complete! {len(mom_df)} stocks.")
+            label, label_color = sentiment_label(composite_score)
 
-                # Summary
-                strong = mom_df[mom_df["Strength"] == "Strong"]
-                weak = mom_df[mom_df["Strength"] == "Weak"]
-                avg_ret = mom_df["Return_Pct"].mean()
+            # Gauge display
+            import plotly.graph_objects as go
 
-                ms1, ms2, ms3, ms4 = st.columns(4)
-                with ms1: st.metric("Avg Return", f"{avg_ret:.2f}%")
-                with ms2: st.metric("Strong Stocks", len(strong))
-                with ms3: st.metric("Weak Stocks", len(weak))
-                with ms4: st.metric("Total", len(mom_df))
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number+delta",
+                value=composite_score,
+                title={"text": f"<b>{label}</b>", "font": {"size": 20, "color": label_color}},
+                number={"font": {"size": 60, "color": COLORS["text_primary"]}},
+                gauge={
+                    "axis": {"range": [0, 100], "tickwidth": 2, "tickcolor": COLORS["text_secondary"]},
+                    "bar": {"color": label_color, "thickness": 0.3},
+                    "bgcolor": COLORS["bg_card"],
+                    "borderwidth": 2,
+                    "bordercolor": COLORS["border"],
+                    "steps": [
+                        {"range": [0, 20], "color": "#004d40"},
+                        {"range": [20, 35], "color": "#1b5e20"},
+                        {"range": [35, 45], "color": "#33691e"},
+                        {"range": [45, 55], "color": "#424242"},
+                        {"range": [55, 65], "color": "#e65100"},
+                        {"range": [65, 80], "color": "#bf360c"},
+                        {"range": [80, 100], "color": "#b71c1c"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "white", "width": 4},
+                        "thickness": 0.8,
+                        "value": composite_score,
+                    },
+                },
+            ))
+            fig_gauge.update_layout(
+                paper_bgcolor=COLORS["bg_primary"],
+                font=dict(color=COLORS["text_primary"]),
+                height=300,
+                margin=dict(l=30, r=30, t=60, b=10),
+            )
+            st.plotly_chart(fig_gauge, use_container_width=True)
 
-                # Chart: horizontal bar of returns
-                import plotly.graph_objects as go
-                from config import PLOTLY_LEGEND
-                top_n = min(30, len(mom_df))
-                chart_df = mom_df.head(top_n)
-                bar_colors = [COLORS["positive"] if r >= 0 else COLORS["negative"]
-                              for r in chart_df["Return_Pct"]]
+            # Indicator scale legend
+            st.markdown(f"""
+            <div style="display:flex; justify-content:center; gap:8px; margin:10px 0; flex-wrap:wrap;">
+                <span style="background:#004d40; color:white; padding:4px 12px; border-radius:4px; font-size:0.8em;">0-20 Extreme Fear</span>
+                <span style="background:#1b5e20; color:white; padding:4px 12px; border-radius:4px; font-size:0.8em;">20-35 Fear</span>
+                <span style="background:#424242; color:white; padding:4px 12px; border-radius:4px; font-size:0.8em;">45-55 Neutral</span>
+                <span style="background:#bf360c; color:white; padding:4px 12px; border-radius:4px; font-size:0.8em;">65-80 Greed</span>
+                <span style="background:#b71c1c; color:white; padding:4px 12px; border-radius:4px; font-size:0.8em;">80-100 Extreme Greed</span>
+            </div>
+            """, unsafe_allow_html=True)
 
-                fig_mom = go.Figure(go.Bar(
-                    x=chart_df["Return_Pct"],
-                    y=chart_df["Ticker"],
-                    orientation="h",
+            # Individual indicators
+            st.markdown("#### Individual Indicators 各項指標")
+            valid_indicators = [i for i in indicators if i.get("score") is not None]
+
+            for i in range(0, len(valid_indicators), 2):
+                cols = st.columns(2)
+                for j, col in enumerate(cols):
+                    idx = i + j
+                    if idx >= len(valid_indicators):
+                        break
+                    ind = valid_indicators[idx]
+                    score = ind["score"]
+                    ind_label, ind_color = sentiment_label(score)
+                    bar_w = score
+
+                    with col:
+                        st.markdown(f"""
+                        <div style="background:{COLORS['bg_card']}; border:1px solid {COLORS['border']};
+                                    border-left:4px solid {ind_color}; border-radius:8px; padding:12px; margin:6px 0;">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <strong style="color:{COLORS['text_primary']};">{ind['name']}</strong>
+                                <span style="color:{ind_color}; font-weight:bold; font-size:1.2em;">{score}/100</span>
+                            </div>
+                            <div style="background:{COLORS['bg_primary']}; border-radius:4px; height:8px; margin:8px 0;">
+                                <div style="background:{ind_color}; width:{bar_w}%; height:100%; border-radius:4px;"></div>
+                            </div>
+                            <div style="color:{COLORS['text_secondary']}; font-size:0.85em;">{ind.get('detail', '')}</div>
+                            <div style="color:{COLORS['text_primary']}; font-size:0.85em; margin-top:4px;">{ind.get('interpretation', '')}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # Horizontal bar chart of all indicators
+            if valid_indicators:
+                names = [i["name"] for i in valid_indicators]
+                scores = [i["score"] for i in valid_indicators]
+                bar_colors = [sentiment_label(s)[1] for s in scores]
+
+                fig_bars = go.Figure(go.Bar(
+                    x=scores, y=names, orientation="h",
                     marker_color=bar_colors,
-                    text=[f"{r:+.1f}%" for r in chart_df["Return_Pct"]],
+                    text=[f"{s}" for s in scores],
                     textposition="outside",
-                    textfont=dict(color=COLORS["text_primary"], size=10),
+                    textfont=dict(color=COLORS["text_primary"]),
                 ))
-                fig_mom.update_layout(
+                fig_bars.add_vline(x=50, line_dash="dash", line_color=COLORS["text_secondary"])
+                fig_bars.update_layout(
                     paper_bgcolor=COLORS["bg_primary"],
                     plot_bgcolor=COLORS["bg_primary"],
                     font=dict(color=COLORS["text_primary"]),
-                    title=dict(text=f"Momentum Ranking ({period_key})",
-                              font=dict(color=COLORS["accent"])),
-                    height=max(top_n * 25, 400),
-                    margin=dict(l=80, r=60, t=50, b=30),
+                    title=dict(text="Indicator Scores (0=Fear, 100=Greed)", font=dict(color=COLORS["accent"])),
+                    height=max(len(valid_indicators) * 35, 300),
+                    margin=dict(l=180, r=50, t=40, b=20),
+                    xaxis=dict(range=[0, 105], gridcolor=COLORS["border"]),
                     yaxis=dict(autorange="reversed", gridcolor=COLORS["border"]),
-                    xaxis=dict(title="Return %", gridcolor=COLORS["border"]),
                 )
-                st.plotly_chart(fig_mom, use_container_width=True)
+                st.plotly_chart(fig_bars, use_container_width=True)
 
-                # Full table
-                st.markdown("#### Full Results 完整結果")
-                st.dataframe(mom_df, use_container_width=True, hide_index=True,
-                            height=min(len(mom_df) * 38 + 40, 500))
+            st.markdown(f'<div class="disclaimer">⚠ 市場情緒指標僅供參考。極端值通常為反向指標：極度恐懼可能是買入機會，極度貪婪可能是賣出時機。</div>', unsafe_allow_html=True)
 
-                # Download Excel
-                excel_bytes = export_momentum_excel(mom_df, period_key)
-                ts = datetime.now().strftime("%Y%m%d_%H%M")
-                st.download_button(
-                    label="📥 Download Excel",
-                    data=excel_bytes,
-                    file_name=f"momentum_{period_key}_{ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_mom",
-                )
+    # ==================== TAB 10: RISK RADAR ====================
+    with tab10:
+        st.markdown("### Risk Radar 風險雷達")
+        st.markdown("監控全球金融壓力、地緣政治風險、以及潛在的 **黑天鵝 / 灰犀牛** 事件。")
 
-                # Top strong & weak picks
-                col_s, col_w = st.columns(2)
-                with col_s:
-                    st.markdown(f"#### 🟢 Strong Stocks 強勢股 (Top 25%)")
-                    if not strong.empty:
-                        for _, row in strong.head(10).iterrows():
-                            st.markdown(f"""
-                            <div class="highlight-box">
-                                <strong>{row['Ticker']}</strong> {row.get('Name', '')} —
-                                <span style="color:{COLORS['positive']}">{row['Return_Pct']:+.2f}%</span>
-                                | RSI: {row.get('RSI', 'N/A')} | Rank #{row.get('Rank', '')}
+        with st.expander("📖 使用說明"):
+            st.markdown(f"""
+<div class="indicator-desc">
+<strong>風險等級 (0-10):</strong><br>
+0-2.5 = 🟢 LOW 低風險 — 市場平穩<br>
+2.5-4 = 🟢 MODERATE 中度 — 正常波動<br>
+4-6 = 🟡 ELEVATED 升高 — 保持警戒<br>
+6-8 = 🟠 HIGH 高風險 — 減碼/避險<br>
+8-10 = 🔴 EXTREME 極端 — 系統性風險可能<br><br>
+<strong>監控項目:</strong><br>
+1. <strong>VIX 市場波動</strong> — 隱含波動率<br>
+2. <strong>Yield Curve 殖利率曲線</strong> — 倒掛=衰退前兆<br>
+3. <strong>Credit Spread 信用利差</strong> — HYG vs LQD<br>
+4. <strong>Gold 黃金</strong> — 避險需求指標<br>
+5. <strong>Oil 原油</strong> — 地緣/通膨風險<br>
+6. <strong>USD 美元</strong> — Risk-Off 指標<br>
+7. <strong>News Risk 新聞掃描</strong> — 即時掃描 Google News 風險關鍵字<br><br>
+<strong>黑天鵝 vs 灰犀牛:</strong><br>
+- <strong>黑天鵝 (Black Swan)</strong>: 無法預測的極端事件 (如 COVID、雷曼兄弟)<br>
+- <strong>灰犀牛 (Gray Rhino)</strong>: 明顯但被忽視的大風險 (如債務危機、房市泡沫)<br>
+新聞掃描會自動偵測相關關鍵字，標示潛在風險。
+</div>
+            """, unsafe_allow_html=True)
+
+        if st.button("⚠️ Scan Global Risks", key="run_risk", type="primary"):
+            progress = st.progress(0, text="Scanning risks...")
+
+            def risk_progress(curr, total, name):
+                if total > 0:
+                    progress.progress(min(curr / total, 1.0), text=f"Checking {name} ({curr}/{total})")
+
+            risk_data = get_full_risk_assessment(progress_callback=risk_progress)
+            progress.empty()
+
+            composite_risk = risk_data["composite_risk"]
+            risk_level = risk_data["risk_level"]
+            risk_color = risk_data["risk_color"]
+
+            # Main risk display
+            import plotly.graph_objects as go
+
+            fig_risk = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=composite_risk,
+                title={"text": f"<b>{risk_level}</b>", "font": {"size": 20, "color": risk_color}},
+                number={"font": {"size": 60, "color": COLORS["text_primary"]}, "suffix": "/10"},
+                gauge={
+                    "axis": {"range": [0, 10], "tickwidth": 2, "tickcolor": COLORS["text_secondary"]},
+                    "bar": {"color": risk_color, "thickness": 0.3},
+                    "bgcolor": COLORS["bg_card"],
+                    "borderwidth": 2,
+                    "bordercolor": COLORS["border"],
+                    "steps": [
+                        {"range": [0, 2.5], "color": "#1b5e20"},
+                        {"range": [2.5, 4], "color": "#33691e"},
+                        {"range": [4, 6], "color": "#f57f17"},
+                        {"range": [6, 8], "color": "#e65100"},
+                        {"range": [8, 10], "color": "#b71c1c"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "white", "width": 4},
+                        "thickness": 0.8,
+                        "value": composite_risk,
+                    },
+                },
+            ))
+            fig_risk.update_layout(
+                paper_bgcolor=COLORS["bg_primary"],
+                font=dict(color=COLORS["text_primary"]),
+                height=280,
+                margin=dict(l=30, r=30, t=60, b=10),
+            )
+            st.plotly_chart(fig_risk, use_container_width=True)
+
+            # Risk indicator cards
+            st.markdown("#### Risk Indicators 風險指標")
+            indicators = risk_data["indicators"]
+
+            for i in range(0, len(indicators), 3):
+                cols = st.columns(3)
+                for j, col in enumerate(cols):
+                    idx = i + j
+                    if idx >= len(indicators):
+                        break
+                    ind = indicators[idx]
+                    rs = ind.get("risk_score", 5)
+                    icon = ind.get("icon", "❓")
+
+                    if rs >= 7: card_border = COLORS["negative"]
+                    elif rs >= 4: card_border = "#ffd740"
+                    else: card_border = COLORS["positive"]
+
+                    risk_bar_w = rs / 10 * 100
+
+                    with col:
+                        st.markdown(f"""
+                        <div style="background:{COLORS['bg_card']}; border:1px solid {COLORS['border']};
+                                    border-left:4px solid {card_border}; border-radius:8px; padding:12px; margin:6px 0;">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <strong style="color:{COLORS['text_primary']};">{icon} {ind['name']}</strong>
+                                <span style="color:{card_border}; font-weight:bold;">{rs}/10</span>
                             </div>
-                            """, unsafe_allow_html=True)
-                with col_w:
-                    st.markdown(f"#### 🔴 Weak Stocks 弱勢股 (Bottom 25%)")
-                    if not weak.empty:
-                        for _, row in weak.tail(10).iterrows():
-                            st.markdown(f"""
-                            <div class="risk-box">
-                                <strong>{row['Ticker']}</strong> {row.get('Name', '')} —
-                                <span style="color:{COLORS['negative']}">{row['Return_Pct']:+.2f}%</span>
-                                | RSI: {row.get('RSI', 'N/A')} | Rank #{row.get('Rank', '')}
+                            <div style="background:{COLORS['bg_primary']}; border-radius:4px; height:6px; margin:8px 0;">
+                                <div style="background:{card_border}; width:{risk_bar_w}%; height:100%; border-radius:4px;"></div>
                             </div>
-                            """, unsafe_allow_html=True)
+                            <div style="color:{COLORS['text_secondary']}; font-size:0.83em;">{ind.get('detail', '')}</div>
+                            <div style="color:{COLORS['text_primary']}; font-size:0.83em; margin-top:3px;">{ind.get('interpretation', '')}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # News risk section
+            st.markdown("---")
+            st.markdown("#### News Risk Scanner 新聞風險掃描")
+
+            news = risk_data["news"]
+            top_risks = news.get("top_risks", [])
+
+            if top_risks:
+                st.markdown(f"偵測到 **{len(top_risks)}** 條高風險新聞 (severity >= 3):")
+
+                for article in top_risks[:10]:
+                    severity = article["score"]
+                    if severity >= 5: sev_color = "#ff1744"
+                    elif severity >= 4: sev_color = "#ff9100"
+                    else: sev_color = "#ffd740"
+
+                    keywords_str = ", ".join([f"{k}({s})" for k, s in article.get("keywords", [])])
+
+                    st.markdown(f"""
+                    <div style="background:{COLORS['bg_card']}; border:1px solid {COLORS['border']};
+                                border-left:4px solid {sev_color}; border-radius:6px; padding:10px; margin:4px 0;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <span style="color:{COLORS['text_primary']}; font-size:0.9em;">{article['title']}</span>
+                            <span style="color:{sev_color}; font-weight:bold; white-space:nowrap; margin-left:10px;">⚠ {severity}/5</span>
+                        </div>
+                        <div style="color:{COLORS['text_secondary']}; font-size:0.75em; margin-top:4px;">
+                            Keywords: {keywords_str}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
             else:
-                st.error("No results. Check ticker symbols or try again.")
+                st.markdown(f"""
+                <div class="highlight-box">
+                    🟢 未偵測到高風險新聞。市場相對平靜。
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown(f'<div class="disclaimer">⚠ 風險分析基於公開數據和新聞關鍵字掃描，不能預測黑天鵝事件。僅供參考，不構成投資建議。</div>', unsafe_allow_html=True)
 
 else:
     # Landing page

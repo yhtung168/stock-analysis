@@ -151,4 +151,4 @@ QUANTITATIVE_INDICATORS = [
 TWSE_BASE_URL = "https://www.twse.com.tw"
 TWSE_OPENAPI_URL = "https://openapi.twse.com.tw/v1"
 TPEX_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1"
-TWSE_REQUEST_DELAY = 3.5  # seconds between requests to avoid IP ban
+TWSE_REQUEST_DELAY = 2.0  # seconds between requests (2s is safe, 3.5s was overly conservative)
